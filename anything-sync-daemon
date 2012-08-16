@@ -1,151 +1,121 @@
 #!/bin/bash
-# Anything-sync-daemon
 # By graysky <graysky AT archlinux DOT us>
-# Modified by Victor Unegbu <victor@unegbu.com>
 # Inspired by some code originally  written by Colin Verot
 
-sanity() {
-	# check the configuration
-	if [[ -z "${WHATTOSYNC[0]}" ]]; then
-		echo "Must define at least one directory in $CONF" >&2
-		return 2
-	fi
+# nothing to do if there is no conf file
+if [[ ! -f /etc/asd.conf ]]; then
+	echo "Cannnot find /etc/asd.conf so bailing.  Reinstall package to use profile-sync-daemon."
+	exit 0
+else
+	. /etc/asd.conf
+fi
 
-	if [[ ! -d "$TMPFS" ]]; then
-		echo "I cannot read $TMPFS which is defined in $CONF" >&2
-		return 3
-	fi
+# nothing to do if these are empty
+if [[ -z "${WHATTOSYNC[0]}" ]]; then
+	echo "Must define at least one directory in the WHATTOSYNC array in /etc/asd.conf"
+	exit 0
+fi
 
-	if [[ -z "$PREFIX" ]]; then
-		echo "Must define a prefix in $CONF" >&2
-		return 4
-	fi
+[[ -z "$VOLATILE" ]] && VOLATILE="/dev/shm"
+[[ -z "$PREFIX_PERMISSIONS" ]] && PREFIX_PERMISSIONS=700
 
-	if [[ -z "$PREFIX_PERMISSIONS" ]]; then
-		echo "Must define prefix permissions in $CONF" >&2
-		return 5
-	fi
+DAEMON_FILE="/run/asd"
+
+check() {
+	local DIR USER BACKUP LINK
+	for DIR in "${WHATTOSYNC[@]}"; do
+		BACKUP="$DIR-backup_asd"  # this is the hdd bound backup in case of power failure
+		if [[ -d "$BACKUP" ]]; then
+			USER=$(/usr/bin/stat -c %U "$BACKUP")
+		else
+			USER=$(/usr/bin/stat -c %U "$DIR")
+		fi
+		LINK="$VOLATILE/asd-$USER$DIR"
+
+		# if the machine was ungracefully shutdown then the backup will be on the filesystem
+		# and the link to tmpfs will be on the filesystem but the contents will be empty
+		# we need to simply remove the link and rotate the backup into place
+
+		if [[ -e "$LINK/.flagged" ]]; then
+			# all is well so continue
+			/bin/true
+		else
+			[[ -h "$DIR" ]] && unlink "$DIR"
+			[[ -d "$BACKUP" ]] && mv "$BACKUP" "$DIR"
+		fi
+	done
 }
 
 sync() {
-	# sync hdd to tmpfs and back again
-	local i STATIC LINK
-	install -d -m"$PREFIX_PERMISSIONS" "$VOLATILE" || {
-		echo "Failed to create $VOLATILE" >&2
-		return 11
-	}
-	
-	for i in "${WHATTOSYNC[@]}"; do
-		STATIC="$i-backup_asd"	# this is the hdd bound backup in case of power failure
-		LINK="$i"	# this is the name of the symlink
+	touch "$DAEMON_FILE"
 
-		if [[ -d $LINK ]]; then
-			[[ -d "$VOLATILE$i" ]] || install -d -m755 "$VOLATILE$i"
+	# sync to tmpfs and back again
+	local DIR USER BACKUP LINK
+	for DIR in "${WHATTOSYNC[@]}"; do
+		BACKUP="$DIR-backup_asd"  # this is the hdd bound backup in case of power failure
+		if [[ -d "$BACKUP" ]]; then
+			USER=$(/usr/bin/stat -c %U "$BACKUP")
+		else
+			USER=$(/usr/bin/stat -c %U "$DIR")
+		fi
+		LINK="$VOLATILE/asd-$USER$DIR"
 
-			# backup targets and link to tmpfs
-			if [[ "$(readlink "$LINK")" != "$VOLATILE$i" ]]; then
-				mv "$LINK" "$STATIC"
-				ln -s "$VOLATILE$i" "$LINK"
+		# make tmpfs container
+		if [[ -d "$DIR" ]]; then
+			[[ -r "$LINK" ]] || su -c "install -dm$PREFIX_PERMISSIONS '$LINK'" $USER
+
+			# backup target and link to tmpfs container
+			if [[ "$(readlink "$DIR")" != "$LINK" ]]; then
+				mv "$DIR" "$BACKUP"
+				ln -s "$LINK" "$DIR"
 			fi
 
-			# sync the RAM targets to the disc
-			if [[ -e "$LINK/.flagged" ]]; then
-				rsync -a --delete --exclude .flagged "$LINK/" "$STATIC/"
+			# sync the tmpfs targets to the disc
+			if [[ -e $LINK/.flagged ]]; then
+				su -c "rsync -a --delete --exclude .flagged '$LINK/' '$BACKUP/'" $USER
 			else
-				rsync -a "$STATIC/" "$LINK/"
-				> "$LINK/.flagged"
+				su -c "rsync -a '$BACKUP/' '$LINK/'" $USER
+				su -c "touch '$LINK/.flagged'" $USER
 			fi
 		fi
 	done
-}
-
-check() {
-	# crash recovery
-	local i STATIC LINK
-	for i in "${WHATTOSYNC[@]}"; do
-		STATIC="$i-backup_asd"  # this is the hdd bound backup in case of power failure
-		LINK="$i" # this is the name of the symlink
-		if [[ ! -e "$VOLATILE$i/.flagged" ]]; then
-			[[ -h "$LINK" ]] && rm -f "$LINK"
-			[[ -d "$STATIC" ]] && mv "$STATIC" "$LINK"
-		fi
-	done
-    /bin/true
 }
 
 unsync() {
-	# restore virgin state on physical discs
-	local i STATIC LINK
-	for i in "${WHATTOSYNC[@]}"; do
-		STATIC="$i-backup_asd"  # this is the hdd bound backup in case of power failure
-		LINK="$i" # this is the name of the symlink
+	local DIR USER BACKUP LINK
+	for DIR in "${WHATTOSYNC[@]}"; do
+		BACKUP="$DIR-backup_asd"  # this is the hdd bound backup in case of power failure
+		USER=$(/usr/bin/stat -c %U "$BACKUP")
+		LINK="$VOLATILE/asd-$USER$DIR"
 
-		# check if target is there
-		if [[ -h "$LINK" ]]; then
-			rm -f "$LINK"
-			[[ -d "$STATIC" ]] && mv "$STATIC" "$LINK"
-			[[ -d "$VOLATILE$i" ]] && rm -rf "$VOLATILE$i"
+		# remove link and move data from tmpfs to disk
+		if [[ -h "$DIR" ]]; then
+			unlink "$DIR"
+			#	this assumes that the backup is always updated so be sure to invoke a sync
+			# before an unsync
+			#
+			# restore original dirtree
+			[[ -d "$BACKUP" ]] && mv "$BACKUP" "$DIR"
+			[[ -d "$LINK" ]] && rm -rf "$VOLATILE/asd-$USER"
 		fi
 	done
-
-	rm -rf "$VOLATILE"
+	rm -f -- "$DAEMON_FILE"
 }
-
-# parse options
-CONF="/etc/asd.conf"
-OPTIND=1
-OPTARG=""
-opt=""
-while getopts 'c:' opt; do
-  case "$opt" in
-    c)  CONF="${OPTARG}";;
-  esac
-done
-shift "$((${OPTIND} - 1))"
-
-[[ ! -f "$CONF" ]] && {
-	echo "$CONF does not exist!" >&2
-	exit 1
-}
-
-source "$CONF"
-
-declare -r VOLATILE="$(readlink -f "$TMPFS")/$PREFIX"
 
 case "$1" in
-    sanity)
-        sanity;;
-    start)
-        if [[ -f $RUNFILE ]]; then
-            echo "Anything-Sync-Daemon is already started."
-        else
-            check
-            sync
-            mkdir -p $(dirname $RUNFILE) > $RUNFILE
-        fi
-        ;;
-    stop)
-        if [[ ! -f $RUNFILE ]]; then
-            echo "Anything-Sync-Daemon is already stopped."
-        else
-            sanity
-            sync
-            unsync
-            rm $RUNFILE
-        fi
-        ;;
-    check)
-        sanity || exit $?
-        check;;
-    sync)
-        sanity || exit $?
-        sync
-        ;;
-    unsync)
-        sanity || exit $?
-        unsync
-        ;;
-    *)
-        # usage
-        echo "usage: $0 [-c <file>] {check|sanity|sync|unsync}"
+	sync)
+		[[ ! -f $DAEMON_FILE ]] && check
+		sync
+		;;
+	unsync)
+		# make sure the daemon ran to setup the links
+		[[ -f $DAEMON_FILE ]] && sync && unsync
+		;;
+	*) 
+		echo -en "\E[31musage: $0 {sync}"
+		tput sgr0 # reset colors to normal
+		echo
+		echo "sync) force a manual sync"
+		;;
 esac
+exit 0

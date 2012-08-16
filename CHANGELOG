@@ -1,7 +1,15 @@
 v3.3
-28-Apr-2012
-Minor tweak where backup dir is renamed to a more obscure name to avoid potential user data loss.
+11-Aug-2012
+Minor fix to initscript.
 
 v3.2
-06-Apr-2012
-Initial public release
+11-Aug-2012
+Fixed systemd compt. issue - thanks xduugu.
+
+v3.1
+11-Aug-2012
+Bug fixes no does multiple users just fine and improved crash recovery.
+
+v3.0
+10-Aug-2012
+Initial public release.
